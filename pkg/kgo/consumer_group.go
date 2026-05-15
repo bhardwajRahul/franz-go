@@ -1893,6 +1893,16 @@ start:
 					)
 					select {
 					case <-ctx.Done():
+						// Cancellation here means the
+						// heartbeat exited (rebalance, new
+						// assignment, client close); the
+						// session is tearing down. Returning
+						// ctx.Err() prevents falling through
+						// to the non-retryable injection path
+						// below, which would surface a
+						// transient retryable error as a fake
+						// fetch error to the user.
+						return ctx.Err()
 					case <-time.After(time.Second):
 						goto start
 					}

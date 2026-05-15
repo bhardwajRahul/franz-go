@@ -3636,6 +3636,123 @@ func Test848FetchOffsetsStaleEpochRetry(t *testing.T) {
 	}
 }
 
+// TestFetchOffsetsUnstableRetryCancel verifies that if the kgo client is
+// in the 1s wait between OffsetFetch retries (because the broker returned
+// UNSTABLE_OFFSET_COMMIT) and the fetchOffsets ctx is canceled by a
+// rebalance, the client does NOT surface the retryable error to the user
+// as a fake fetch error. fetchOffsets is shared between classic and 848
+// group management, so this race affects both; the test exercises it via
+// 848 because that is where TestTxnEtl/sticky/848 first surfaced it.
+//
+// Regression test for: fetchOffsets used to fall through from the retry
+// wait into the "non-retryable partition error" injection path whenever
+// ctx.Done() fired during the wait, even though the underlying error was
+// retryable. The user's next PollFetches then surfaced a spurious
+// UNSTABLE_OFFSET_COMMIT.
+func TestFetchOffsetsUnstableRetryCancel(t *testing.T) {
+	t.Parallel()
+	topic := "t-unstable-retry-cancel"
+	group := "test-unstable-retry-cancel"
+	c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(4, topic))
+
+	// Produce one record to every partition so cl1 will have records to
+	// consume after the rebalance completes (which is how the test exits).
+	pCl := newPlainClient(t, c)
+	for p := int32(0); p < 4; p++ {
+		produceSync(t, pCl, &kgo.Record{Topic: topic, Partition: p, Value: []byte("v")})
+	}
+	pCl.Close()
+
+	// Intercept the FIRST OffsetFetch and return UNSTABLE_OFFSET_COMMIT
+	// for every requested partition. The kgo client treats this as
+	// retryable and enters a 1s sleep before retrying.
+	var firstOnce sync.Once
+	fetchSeen := make(chan struct{}, 1)
+	c.ControlKey(int16(kmsg.OffsetFetch), func(kreq kmsg.Request) (kmsg.Response, error, bool) {
+		var fail bool
+		firstOnce.Do(func() { fail = true })
+		if !fail {
+			return nil, nil, false
+		}
+		c.KeepControl()
+		req := kreq.(*kmsg.OffsetFetchRequest)
+		resp := req.ResponseKind().(*kmsg.OffsetFetchResponse)
+		if len(req.Groups) == 0 {
+			return nil, nil, false
+		}
+		sg := kmsg.NewOffsetFetchResponseGroup()
+		sg.Group = req.Groups[0].Group
+		for _, rt := range req.Groups[0].Topics {
+			st := kmsg.NewOffsetFetchResponseGroupTopic()
+			st.Topic = rt.Topic
+			st.TopicID = rt.TopicID
+			for _, p := range rt.Partitions {
+				sp := kmsg.NewOffsetFetchResponseGroupTopicPartition()
+				sp.Partition = p
+				sp.ErrorCode = kerr.UnstableOffsetCommit.Code
+				st.Partitions = append(st.Partitions, sp)
+			}
+			sg.Topics = append(sg.Topics, st)
+		}
+		resp.Groups = append(resp.Groups, sg)
+		select {
+		case fetchSeen <- struct{}{}:
+		default:
+		}
+		return resp, nil, true
+	})
+
+	cl1 := newClient848(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+	defer cl1.Close()
+
+	// Wait for the broker to send UNSTABLE_OFFSET_COMMIT. After that cl1
+	// is processing the response and about to enter the 1s retry sleep;
+	// a short pause makes the rebalance land inside the sleep window.
+	select {
+	case <-fetchSeen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("did not see OffsetFetch within 5s")
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// Joining a second consumer in the same group forces the server to
+	// push a new assignment to cl1. cl1's heartbeat exits and cancels
+	// the in-flight fetchOffsets retry ctx. With the bug, fetchOffsets
+	// falls through and adds a fake UNSTABLE_OFFSET_COMMIT to cl1's
+	// fakeReadyForDraining queue, which the user observes on the next
+	// PollFetches. With the fix, no fake error is added.
+	cl2 := newClient848(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+	defer cl2.Close()
+
+	// Poll cl1 for a few seconds. With the bug, the fake UNSTABLE
+	// error sits in fakeReadyForDraining and surfaces on the first
+	// poll. With the fix, nothing of the sort is queued, so the
+	// poll either returns records (rebalance reconciled) or times
+	// out on its short context. We only care that UNSTABLE is never
+	// surfaced; records are nice but not required.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		fetches := cl1.PollFetches(ctx)
+		cancel()
+		for _, fe := range fetches.Errors() {
+			if errors.Is(fe.Err, kerr.UnstableOffsetCommit) {
+				t.Fatalf("regression: PollFetches surfaced UNSTABLE_OFFSET_COMMIT: %v", fe.Err)
+			}
+		}
+	}
+}
+
 func TestElectLeaders(t *testing.T) {
 	t.Parallel()
 	topic := "t-elect-leaders"

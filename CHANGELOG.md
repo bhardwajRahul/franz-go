@@ -1,3 +1,32 @@
+v1.21.2
+===
+
+This patch release contains two narrow bug fixes and one small feature.
+Deps are also bumped so that you are force-pinned to a klauspost/compress
+version that has a stack-splitting bugfix that sometimes affected franz-go.
+
+* `PurgeTopicsFromConsuming` now correctly persists deleted topics if
+  you also had specific topics paused. Previously, when a topic had
+  partition-level pauses, unpausing the topic itself (while keeping
+  specific partitions paused) was bugged and the topic was stuck in
+  an "all paused" state (thanks @gorakdev!).
+
+* `PollFetches` no longer surfaces a spurious `UNSTABLE_OFFSET_COMMIT`
+  fetch error when an OffsetFetch retry is canceled mid-wait by a
+  rebalance or client close. Observed flaking `TestTxnEtl/sticky/848`
+  on KIP-848 consumer groups under transactional load.
+
+* The MSK IAM SASL mechanism now honors `AWS_REGION` when the broker
+  hostname does not match the standard MSK URL format, allowing
+  connections through custom DNS names (e.g. private link endpoints)
+  (thanks @janmoritzmeyer0210!).
+
+## Relevant commits
+
+- [`22a17320`](https://github.com/twmb/franz-go/commit/22a17320) **bugfix** kgo: do not inject fake fetch error when OffsetFetch retry is canceled
+- [`95d74ab3`](https://github.com/twmb/franz-go/commit/95d74ab3) **bugfix** kgo: fix delTopics not writing back modified pausedPartitions struct (thanks @gorakdev!)
+- [`40e5a0e5`](https://github.com/twmb/franz-go/commit/40e5a0e5) **feature** sasl/aws: support custom AWS MSK DNS names (thanks @janmoritzmeyer0210!)
+
 v1.21.1
 ===
 
